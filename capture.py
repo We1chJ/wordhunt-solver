@@ -2,6 +2,7 @@
 Finds the iPhone Mirroring window on Mac and captures a screenshot of it.
 """
 import sys
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -65,6 +66,8 @@ def capture_phone_mirroring() -> tuple[np.ndarray, dict]:
         img_bgr = np.array(img_rgb)[..., ::-1].copy()  # RGB → BGR for OpenCV
 
     print(f"[capture] Screenshot size: {img_bgr.shape[1]}×{img_bgr.shape[0]} px")
+    cv2.imwrite("debug_capture.png", img_bgr)
+    print("[capture] Saved → debug_capture.png")
     return img_bgr, bounds
 
 

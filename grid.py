@@ -2,18 +2,19 @@
 Detects the 4x4 Word Hunt letter grid from a screenshot and OCRs each cell.
 
 Detection strategy:
-  1. Convert to HSV and mask out highly-saturated (colored) blobs — the tiles.
-  2. Find contours, filter for roughly-square shapes of similar area.
-  3. If we find 16 candidates arranged in a 4×4 layout, use them.
-  4. Otherwise fall back to a saved calibration or prompt the user.
+  1. Convert to HSV, mask highly-saturated colored blobs (the tiles).
+  2. Filter contours to tile-sized, roughly-square shapes.
+  3. From however many candidates we find, compute the dominant grid spacing
+     using pairwise distances between blob centers, then extrapolate all 16
+     cell positions — works even if some tiles were missed.
+  4. Fall back to saved calibration or interactive prompt if detection fails.
 
 OCR per cell:
-  - Isolate the white letter on its colored background via HSV value mask.
+  - Isolate the white letter via brightness threshold.
   - Run Tesseract in single-char mode with A-Z whitelist.
 """
 
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -28,84 +29,189 @@ except ImportError:
 CALIBRATION_FILE = Path(__file__).parent / "calibration.json"
 GRID_ROWS, GRID_COLS = 4, 4
 
+# Known grid corners (relative to the iPhone Mirroring screenshot).
+# Top-left and bottom-right of the 4×4 letter grid.
+GRID_X1, GRID_Y1 = 49, 324
+GRID_X2, GRID_Y2 = 266, 544
+
+
+def _region_to_grid(x1: int, y1: int, x2: int, y2: int) -> list[list[tuple]]:
+    """Divide a rectangle into a GRID_ROWS × GRID_COLS array of (x,y,w,h) cells."""
+    cell_w = (x2 - x1) // GRID_COLS
+    cell_h = (y2 - y1) // GRID_ROWS
+    return [
+        [(x1 + col * cell_w, y1 + row * cell_h, cell_w, cell_h)
+         for col in range(GRID_COLS)]
+        for row in range(GRID_ROWS)
+    ]
+
 
 # ---------------------------------------------------------------------------
 # Grid detection
 # ---------------------------------------------------------------------------
 
-def _saturated_mask(bgr: np.ndarray) -> np.ndarray:
+def _colored_blob_mask(bgr: np.ndarray) -> np.ndarray:
     """Binary mask of pixels belonging to brightly-colored tiles."""
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    # High saturation = colored tile; exclude near-white and near-black
-    mask = cv2.inRange(hsv, (0, 80, 80), (180, 255, 255))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=3)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+    mask = cv2.inRange(hsv, (0, 60, 60), (180, 255, 255))
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k, iterations=2)
     return mask
 
 
-def _find_tile_contours(mask: np.ndarray, img_area: int) -> list[tuple]:
+def _blob_centers(bgr: np.ndarray) -> list[tuple[float, float, float]]:
     """
-    Return (x, y, w, h) for contours that look like letter tiles:
-    roughly square, area between 0.1% and 5% of the image.
+    Return (cx, cy, size) for each candidate tile blob.
+    size = sqrt(area), used to estimate tile dimensions later.
     """
+    img_area = bgr.shape[0] * bgr.shape[1]
+    mask = _colored_blob_mask(bgr)
+    cv2.imwrite("debug_mask.png", mask)
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates = []
+    blobs = []
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         area = w * h
-        if area < img_area * 0.001 or area > img_area * 0.05:
+        if area < img_area * 0.0005 or area > img_area * 0.06:
             continue
         aspect = w / h if h else 0
-        if not (0.6 < aspect < 1.6):
+        if not (0.5 < aspect < 2.0):
             continue
-        candidates.append((x, y, w, h))
-    return candidates
+        blobs.append((x + w / 2, y + h / 2, (area ** 0.5)))
+    return blobs
 
 
-def _cluster_to_grid(candidates: list[tuple]) -> list[list[tuple]] | None:
+def _dominant_spacing(values: list[float], min_spacing: float) -> float | None:
     """
-    Try to organise candidates into a GRID_ROWS × GRID_COLS grid sorted
-    by (row, col). Returns None if the layout doesn't fit a 4×4 grid.
+    Given a list of 1-D positions, find the most common gap between them
+    that is >= min_spacing. Returns None if nothing reliable found.
+    Uses a histogram with bin width = 5% of min_spacing.
     """
-    if len(candidates) != GRID_ROWS * GRID_COLS:
+    diffs = []
+    sv = sorted(values)
+    for i in range(len(sv)):
+        for j in range(i + 1, len(sv)):
+            d = sv[j] - sv[i]
+            if d >= min_spacing:
+                diffs.append(d)
+    if not diffs:
         return None
 
-    # Sort by Y then X
-    by_y = sorted(candidates, key=lambda r: r[1])
-    rows = [sorted(by_y[i * GRID_COLS:(i + 1) * GRID_COLS], key=lambda r: r[0])
-            for i in range(GRID_ROWS)]
+    bin_w = max(1.0, min_spacing * 0.05)
+    n_bins = int(max(diffs) / bin_w) + 1
+    hist = np.zeros(n_bins)
+    for d in diffs:
+        hist[int(d / bin_w)] += 1
 
-    # Sanity: all cells in a row should share similar Y, all in a col similar X
-    row_ys = [np.mean([r[1] for r in row]) for row in rows]
-    for i in range(1, len(row_ys)):
-        if row_ys[i] - row_ys[i - 1] < 5:
-            return None
-    return rows
+    # Weight by 1/multiplier so we prefer the fundamental period, not harmonics
+    for i in range(n_bins):
+        for m in range(2, 5):
+            j = int(i * m)
+            if j < n_bins:
+                hist[i] += hist[j] / m
+
+    best_bin = int(np.argmax(hist))
+    return (best_bin + 0.5) * bin_w
 
 
 def auto_detect_grid(bgr: np.ndarray) -> list[list[tuple]] | None:
     """
     Attempt to auto-detect the 4×4 grid.
     Returns a 4×4 list of (x, y, w, h) bounding boxes, or None on failure.
+
+    Works in three stages:
+      1. Find colored blobs and their centers.
+      2. Compute the dominant horizontal and vertical grid spacing from
+         all pairwise distances — doesn't require exactly 16 blobs.
+      3. Snap blob centers to the nearest grid position, pick the 4×4
+         region with the most coverage, and extrapolate any missing cells.
     """
-    h, w = bgr.shape[:2]
-    mask = _saturated_mask(bgr)
+    blobs = _blob_centers(bgr)
+    print(f"[grid] Colored blobs found: {len(blobs)}")
 
-    # Save mask for debugging
-    cv2.imwrite("debug_mask.png", mask)
+    if len(blobs) < 4:
+        print("[grid] Too few blobs for auto-detection.")
+        return None
 
-    candidates = _find_tile_contours(mask, w * h)
-    print(f"[grid] Tile candidates found: {len(candidates)}")
+    xs = [b[0] for b in blobs]
+    ys = [b[1] for b in blobs]
+    sizes = [b[2] for b in blobs]
+    median_size = float(np.median(sizes))
 
-    grid = _cluster_to_grid(candidates)
-    if grid is not None:
-        print("[grid] Auto-detection succeeded.")
+    # Minimum plausible tile spacing = half the median tile size
+    min_gap = median_size * 0.5
+
+    step_x = _dominant_spacing(xs, min_gap)
+    step_y = _dominant_spacing(ys, min_gap)
+
+    if step_x is None or step_y is None:
+        print(f"[grid] Could not determine grid spacing (step_x={step_x}, step_y={step_y}).")
+        return None
+
+    print(f"[grid] Detected tile spacing: x={step_x:.1f}px  y={step_y:.1f}px")
+
+    # Snap every blob to a grid coordinate
+    # grid_coord = round(position / step)
+    def snap(pos, step):
+        return round(pos / step)
+
+    snapped = [(snap(cx, step_x), snap(cy, step_y), cx, cy) for cx, cy, _ in blobs]
+
+    # Find the 4×4 window of grid coords with the most blobs
+    gxs = [s[0] for s in snapped]
+    gys = [s[1] for s in snapped]
+    best_origin = None
+    best_count = 0
+    for ox in range(min(gxs), max(gxs) - GRID_COLS + 2):
+        for oy in range(min(gys), max(gys) - GRID_ROWS + 2):
+            count = sum(
+                1 for gx, gy, _, _ in snapped
+                if ox <= gx < ox + GRID_COLS and oy <= gy < oy + GRID_ROWS
+            )
+            if count > best_count:
+                best_count = count
+                best_origin = (ox, oy)
+
+    if best_origin is None or best_count < 4:
+        print(f"[grid] Could not find a plausible 4×4 window (best coverage: {best_count}/16).")
+        return None
+
+    ox, oy = best_origin
+    print(f"[grid] Grid window origin ({ox},{oy}), coverage {best_count}/16")
+
+    # Build a lookup: (grid_col, grid_row) → actual pixel center
+    lookup: dict[tuple, tuple] = {}
+    for gx, gy, cx, cy in snapped:
+        col, row = gx - ox, gy - oy
+        if 0 <= col < GRID_COLS and 0 <= row < GRID_ROWS:
+            lookup[(col, row)] = (cx, cy)
+
+    # Estimate the grid origin in pixel space from known blob positions
+    if lookup:
+        sample_col, sample_row = next(iter(lookup))
+        sample_cx, sample_cy = lookup[(sample_col, sample_row)]
+        origin_px_x = sample_cx - sample_col * step_x
+        origin_px_y = sample_cy - sample_row * step_y
     else:
-        print(
-            f"[grid] Auto-detection failed (need 16 tiles, found {len(candidates)}). "
-            "Run calibrate() or provide grid coordinates manually."
-        )
+        return None
+
+    cell_w = int(step_x)
+    cell_h = int(step_y)
+    half_w = cell_w // 2
+    half_h = cell_h // 2
+
+    grid: list[list[tuple]] = []
+    for row in range(GRID_ROWS):
+        cols = []
+        for col in range(GRID_COLS):
+            cx = int(origin_px_x + col * step_x)
+            cy = int(origin_px_y + row * step_y)
+            cols.append((cx - half_w, cy - half_h, cell_w, cell_h))
+        grid.append(cols)
+
+    print("[grid] Auto-detection succeeded.")
     return grid
 
 
@@ -215,17 +321,10 @@ def ocr_cell(cell_bgr: np.ndarray) -> str:
 def get_grid_layout(bgr: np.ndarray) -> list[list[tuple]]:
     """
     Return the 4×4 grid layout (each cell as (x,y,w,h)).
-    Tries: auto-detect → saved calibration → interactive calibration.
+    Uses the hardcoded GRID_X/Y constants directly — no auto-detection needed.
     """
-    grid = auto_detect_grid(bgr)
-    if grid is not None:
-        return grid
-
-    grid = load_calibration()
-    if grid is not None:
-        return grid
-
-    return calibrate(bgr)
+    print(f"[grid] Using hardcoded region ({GRID_X1},{GRID_Y1}) → ({GRID_X2},{GRID_Y2})")
+    return _region_to_grid(GRID_X1, GRID_Y1, GRID_X2, GRID_Y2)
 
 
 def parse_grid(bgr: np.ndarray, save_debug: bool = True) -> list[list[str]]:
