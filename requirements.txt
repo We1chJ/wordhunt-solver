@@ -1,0 +1,6 @@
+pyobjc-framework-Quartz
+mss
+opencv-python
+pytesseract
+Pillow
+numpy

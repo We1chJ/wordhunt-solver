@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Debug images
+debug_*.png
+
+# Calibration (machine-specific)
+calibration.json
+
+# Editor
+.vscode/
+
+# macOS
+.DS_Store
