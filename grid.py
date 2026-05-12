@@ -274,35 +274,51 @@ def load_calibration() -> list[list[tuple]] | None:
 _paddle_ocr = None
 
 
+def preload_ocr() -> None:
+    """Eagerly initialize the PaddleOCR model. Safe to call multiple times."""
+    _get_ocr()
+
+
 def _get_ocr():
     global _paddle_ocr
     if _paddle_ocr is None:
         from paddleocr import PaddleOCR
+        print("[ocr] Loading PaddleOCR model...", end=" ", flush=True)
         _paddle_ocr = PaddleOCR(
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
             lang="en",
         )
-        print("[ocr] PaddleOCR initialized")
+        print("ready.")
     return _paddle_ocr
 
 
-def ocr_cell(cell_bgr: np.ndarray) -> str:
-    """Run PaddleOCR on a pre-cropped cell and return the single letter."""
-    ocr = _get_ocr()
+def _prep_cell(cell_bgr: np.ndarray) -> np.ndarray:
     h, w = cell_bgr.shape[:2]
     scale = max(1, 96 // min(h, w))
     if scale > 1:
         cell_bgr = cv2.resize(cell_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    return cell_bgr
 
-    results = ocr.predict(cell_bgr)
-    if results:
-        for text in results[0].get("rec_texts", []):
-            for ch in text.strip().upper():
-                if ch.isalpha():
-                    return ch
+
+def _first_alpha(text: str) -> str:
+    for ch in text.strip().upper():
+        if ch.isalpha():
+            return ch
     return "I"
+
+
+def ocr_cells_batch(cells: list[np.ndarray]) -> list[str]:
+    """Run PaddleOCR on all cells in a single batched predict call."""
+    ocr = _get_ocr()
+    prepped = [_prep_cell(c) for c in cells]
+    results = ocr.predict(prepped)
+    letters = []
+    for res in results:
+        texts = res.get("rec_texts", []) if res else []
+        letters.append(_first_alpha(texts[0]) if texts else "I")
+    return letters
 
 
 # ---------------------------------------------------------------------------
@@ -325,21 +341,22 @@ def parse_grid(bgr: np.ndarray, save_debug: bool = True) -> list[list[str]]:
     """
     grid_layout = get_grid_layout(bgr)
 
+    cells = [bgr[y: y + h, x: x + w] for row in grid_layout for x, y, w, h in row]
+    flat_letters = ocr_cells_batch(cells)
+
     letters: list[list[str]] = []
     debug = bgr.copy() if save_debug else None
+    idx = 0
 
-    for row_idx, row in enumerate(grid_layout):
+    for row in grid_layout:
         letter_row = []
-        for col_idx, (x, y, w, h) in enumerate(row):
-            cell = bgr[y: y + h, x: x + w]
-            letter = ocr_cell(cell)
+        for x, y, w, h in row:
+            letter = flat_letters[idx]; idx += 1
             letter_row.append(letter)
-
             if save_debug and debug is not None:
                 cv2.rectangle(debug, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cv2.putText(debug, letter, (x + 4, y + h - 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
         letters.append(letter_row)
 
     if save_debug and debug is not None:

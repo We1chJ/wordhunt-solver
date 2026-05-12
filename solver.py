@@ -8,19 +8,27 @@ from pathlib import Path
 WORDBANK_PATH = Path(__file__).parent / "wordbank.txt"
 MIN_WORD_LEN = 3
 
+_words: set[str] | None = None
+_prefixes: set[str] | None = None
 
-def load_wordbank(path: Path = WORDBANK_PATH) -> tuple[set[str], set[str]]:
-    """Return (words, prefixes) sets, both uppercase."""
+
+def preload() -> None:
+    """Load wordbank into module-level cache. Safe to call multiple times."""
+    global _words, _prefixes
+    if _words is not None:
+        return
+    print("[solver] Loading wordbank...", end=" ", flush=True)
     words: set[str] = set()
     prefixes: set[str] = set()
-    for line in path.read_text().splitlines():
+    for line in WORDBANK_PATH.read_text().splitlines():
         w = line.strip().upper()
         if not w:
             continue
         words.add(w)
         for i in range(1, len(w) + 1):
             prefixes.add(w[:i])
-    return words, prefixes
+    _words, _prefixes = words, prefixes
+    print(f"{len(_words)} words loaded.")
 
 
 def neighbors(row: int, col: int, rows: int = 4, cols: int = 4) -> list[tuple[int, int]]:
@@ -39,9 +47,10 @@ def solve(grid: list[list[str]]) -> list[tuple[str, list[tuple[int, int]]]]:
     """
     Return a list of (word, path) for every valid word found in the grid,
     including duplicate words reached via different tile paths.
-    Results are sorted longest-first, then alphabetically, then by path.
+    Results are sorted longest-first, then alphabetically.
     """
-    words, prefixes = load_wordbank()
+    preload()
+    words, prefixes = _words, _prefixes
     found: list[tuple[str, list[tuple[int, int]]]] = []
 
     rows, cols = len(grid), len(grid[0])
