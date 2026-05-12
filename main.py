@@ -8,6 +8,7 @@ Usage:
 import sys
 import cv2
 from grid import parse_grid, print_grid
+from solver import solve, print_solutions
 
 
 def main():
@@ -18,21 +19,24 @@ def main():
         img = cv2.imread(path)
         if img is None:
             sys.exit(f"Could not load image: {path}")
-        print(f"[1/2] Using saved image: {path}")
+        print(f"[1/3] Using saved image: {path}")
     else:
         from capture import capture_phone_mirroring
-        print("[1/2] Capturing iPhone Mirroring window...")
+        print("[1/3] Capturing iPhone Mirroring window...")
         try:
             img, _ = capture_phone_mirroring()
         except RuntimeError as e:
             sys.exit(f"Error: {e}")
 
-    print("\n[2/2] Detecting and parsing grid...")
+    print("\n[2/3] Detecting and parsing grid...")
     letters = parse_grid(img, save_debug=True)
 
     print("\nDetected grid:")
     print_grid(letters)
-    print("\nFlat list (row by row):", [l for row in letters for l in row])
+
+    print("\n[3/3] Solving...")
+    solutions = solve(letters)
+    print_solutions(solutions)
 
 
 if __name__ == "__main__":
