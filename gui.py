@@ -231,33 +231,39 @@ class WordHuntApp:
     def _start_global_hotkeys(self):
         import subprocess, sys
 
+        # pynput runs inside a child process to avoid GIL conflicts with tkinter.
+        # It manages its own event loop and thread state cleanly.
         _MONITOR_SCRIPT = """
 import sys
-from AppKit import NSEvent, NSKeyDownMask, NSApplication
-from AppKit import NSApplicationActivationPolicyProhibited
-from Foundation import NSRunLoop, NSDate
+from pynput import keyboard
 
-app = NSApplication.sharedApplication()
-app.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+def on_press(key):
+    try:
+        if key == keyboard.Key.right:
+            sys.stdout.write("R\\n"); sys.stdout.flush()
+        elif key == keyboard.Key.left:
+            sys.stdout.write("L\\n"); sys.stdout.flush()
+    except Exception:
+        pass
 
-def _handler(event):
-    code = event.keyCode()
-    if code == 124:
-        sys.stdout.write("R\\n"); sys.stdout.flush()
-    elif code == 123:
-        sys.stdout.write("L\\n"); sys.stdout.flush()
-
-NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(NSKeyDownMask, _handler)
-
-while True:
-    NSRunLoop.mainRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.05))
+sys.stderr.write("key_monitor: started\\n"); sys.stderr.flush()
+with keyboard.Listener(on_press=on_press) as listener:
+    listener.join()
 """
 
         try:
             self._key_proc = subprocess.Popen(
                 [sys.executable, "-c", _MONITOR_SCRIPT],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
+
+            # Log subprocess stderr so permission errors are visible
+            def _log_stderr():
+                for line in self._key_proc.stderr:
+                    print(f"[hotkey] {line.rstrip()}")
+            threading.Thread(target=_log_stderr, daemon=True).start()
 
             def _read_loop():
                 for line in self._key_proc.stdout:
@@ -266,11 +272,10 @@ while True:
                         self.root.after(0, self._next_word)
                     elif ch == "L":
                         self.root.after(0, self._prev_word)
-
             threading.Thread(target=_read_loop, daemon=True).start()
-            print("[hotkey] Global arrow-key monitor active (← / →)")
+
         except Exception as exc:
-            print(f"[hotkey] Subprocess monitor failed: {exc}. Falling back to window-focus bindings.")
+            print(f"[hotkey] Could not start key monitor: {exc}")
 
         # Also bind locally for when the GUI window has focus
         self.root.bind("<Left>",  lambda _: self._prev_word())
