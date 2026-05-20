@@ -1,4 +1,4 @@
-# Word Hunt Assistant
+# Word Hunt Solver
 
 A Mac desktop tool that captures your iPhone Mirroring screen, OCRs the 4×4 letter grid, solves for every valid word, and auto-plays them all — dragging the mouse through each path on the game board automatically.
 
